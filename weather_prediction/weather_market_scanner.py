@@ -7,6 +7,7 @@ matches them to cities, and returns structured market data.
 
 import time
 import re
+import json
 import requests
 from typing import Dict, List, Optional
 
@@ -212,7 +213,11 @@ class WeatherMarketScanner:
         if not question:
             return None
 
-        market_id = raw_market.get("condition_id", raw_market.get("id", ""))
+        market_id = (
+            raw_market.get("condition_id")
+            or raw_market.get("conditionId")
+            or raw_market.get("id", "")
+        )
         if not market_id:
             return None
 
@@ -230,14 +235,20 @@ class WeatherMarketScanner:
             outcome = t.get("outcome", "").lower()
             if outcome == "yes":
                 yes_price = float(t.get("price", 0)) if t.get("price") else None
-                yes_token_id = t.get("token_id", "")
+                yes_token_id = t.get("token_id") or t.get("tokenId") or t.get("id", "")
             elif outcome == "no":
                 no_price = float(t.get("price", 0)) if t.get("price") else None
-                no_token_id = t.get("token_id", "")
+                no_token_id = t.get("token_id") or t.get("tokenId") or t.get("id", "")
 
         # Fallback price fields seen in Gamma payloads.
         if yes_price is None or no_price is None:
             outcome_prices = raw_market.get("outcomePrices") or raw_market.get("outcome_prices")
+            if isinstance(outcome_prices, str):
+                # Some Gamma payloads provide JSON-string arrays.
+                try:
+                    outcome_prices = json.loads(outcome_prices)
+                except Exception:
+                    outcome_prices = []
             if isinstance(outcome_prices, list) and len(outcome_prices) >= 2:
                 try:
                     if yes_price is None:
@@ -250,6 +261,11 @@ class WeatherMarketScanner:
         # Fallback token id fields seen in some payloads.
         if not yes_token_id or not no_token_id:
             clob_token_ids = raw_market.get("clobTokenIds") or raw_market.get("clob_token_ids")
+            if isinstance(clob_token_ids, str):
+                try:
+                    clob_token_ids = json.loads(clob_token_ids)
+                except Exception:
+                    clob_token_ids = []
             if isinstance(clob_token_ids, list) and len(clob_token_ids) >= 2:
                 yes_token_id = yes_token_id or str(clob_token_ids[0])
                 no_token_id = no_token_id or str(clob_token_ids[1])
