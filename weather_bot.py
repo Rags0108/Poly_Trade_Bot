@@ -128,19 +128,25 @@ def main():
     set_weather_engine(engine)
 
     # Start Telegram bot in background (optional)
+    telegram_enabled = False
     if not args.no_telegram:
         telegram_token = os.getenv("TELEGRAM_TOKEN", "").strip()
         if telegram_token:
-            print("🤖 Starting Telegram bot...")
-            threading.Thread(target=run_bot, daemon=True).start()
+            telegram_enabled = True
         else:
             print("ℹ️ No TELEGRAM_TOKEN — Telegram alerts disabled")
 
     # Start health-check server for Railway (non-blocking)
     threading.Thread(target=_start_health_server, daemon=True).start()
 
-    # Start trading engine (blocking)
-    engine.start()
+    # If Telegram is enabled, run engine in background and keep Telegram polling
+    # on the main thread for maximum stability.
+    if telegram_enabled:
+        print("🤖 Starting Telegram bot...")
+        threading.Thread(target=engine.start, daemon=True).start()
+        run_bot()
+    else:
+        engine.start()
 
 
 if __name__ == "__main__":

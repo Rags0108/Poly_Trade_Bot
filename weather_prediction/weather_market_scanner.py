@@ -21,6 +21,8 @@ WEATHER_KEYWORDS = [
     "drought", "flood", "celsius", "fahrenheit", "degrees", "hot", "warm",
     "climate", "heatwave", "blizzard", "cyclone", "typhoon", "monsoon",
     "sunny", "cloudy", "fog", "humidity", "barometric", "pressure",
+    "rainfall", "snowfall", "record high", "record low", "degrees in",
+    "temp in", "high temp", "low temp",
 ]
 
 # Cache
@@ -52,10 +54,15 @@ class WeatherMarketScanner:
                 return data
 
         weather_markets = []
+        seen_ids = set()
 
         try:
-            # Search via Gamma API events
+            # First pass: active markets feed
             markets = self._fetch_gamma_markets(limit)
+
+            # Second pass: keyword-targeted queries to avoid missing weather markets
+            for term in ("weather", "temperature", "rain", "snow"):
+                markets.extend(self._fetch_gamma_markets_by_query(term, 80))
 
             for m in markets:
                 question = m.get("question", "")
@@ -64,9 +71,14 @@ class WeatherMarketScanner:
 
                 # Parse market data
                 parsed = self._parse_market(m)
-                if parsed:
+                if parsed and parsed["market_id"] not in seen_ids:
+                    seen_ids.add(parsed["market_id"])
                     weather_markets.append(parsed)
                     self._known_markets[parsed["market_id"]] = parsed
+
+            print(
+                f"🔎 Scanner: checked={len(markets)} weather={len(weather_markets)}"
+            )
 
         except Exception as e:
             print(f"⚠️ Market scan error: {e}")
@@ -164,6 +176,31 @@ class WeatherMarketScanner:
 
         return all_markets
 
+    def _fetch_gamma_markets_by_query(self, query: str, limit: int) -> List[dict]:
+        """Fetch markets with a query term using Gamma's search-compatible params."""
+        try:
+            for query_key in ("query", "search"):
+                resp = self._session.get(
+                    f"{GAMMA_API_URL}/markets",
+                    params={
+                        "limit": min(100, limit),
+                        "active": True,
+                        "closed": False,
+                        query_key: query,
+                    },
+                    timeout=12,
+                )
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+                if isinstance(data, list):
+                    return data
+                if isinstance(data, dict) and "data" in data:
+                    return data.get("data", [])
+        except Exception:
+            pass
+        return []
+
     def _is_weather_market(self, question: str) -> bool:
         """Check if a market question is weather-related."""
         q = question.lower()
@@ -197,6 +234,25 @@ class WeatherMarketScanner:
             elif outcome == "no":
                 no_price = float(t.get("price", 0)) if t.get("price") else None
                 no_token_id = t.get("token_id", "")
+
+        # Fallback price fields seen in Gamma payloads.
+        if yes_price is None or no_price is None:
+            outcome_prices = raw_market.get("outcomePrices") or raw_market.get("outcome_prices")
+            if isinstance(outcome_prices, list) and len(outcome_prices) >= 2:
+                try:
+                    if yes_price is None:
+                        yes_price = float(outcome_prices[0])
+                    if no_price is None:
+                        no_price = float(outcome_prices[1])
+                except Exception:
+                    pass
+
+        # Fallback token id fields seen in some payloads.
+        if not yes_token_id or not no_token_id:
+            clob_token_ids = raw_market.get("clobTokenIds") or raw_market.get("clob_token_ids")
+            if isinstance(clob_token_ids, list) and len(clob_token_ids) >= 2:
+                yes_token_id = yes_token_id or str(clob_token_ids[0])
+                no_token_id = no_token_id or str(clob_token_ids[1])
 
         return {
             "market_id": market_id,

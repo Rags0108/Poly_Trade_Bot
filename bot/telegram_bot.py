@@ -10,6 +10,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 app_instance = None
+_telegram_loop = None
 
 
 # =========================
@@ -166,7 +167,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_telegram_message(text: str):
     global app_instance
-    if app_instance:
+    if app_instance and CHAT_ID:
         await app_instance.bot.send_message(chat_id=CHAT_ID, text=text)
 
 
@@ -175,12 +176,17 @@ def send_message_sync(text: str):
     Allows other threads (trading loop) to send messages safely.
     Uses run_coroutine_threadsafe for cross-thread async calls.
     """
-    if app_instance and app_instance.running:
+    if app_instance and app_instance.running and _telegram_loop and CHAT_ID:
         try:
-            loop = app_instance.updater.asyncio_task.get_loop()
-            asyncio.run_coroutine_threadsafe(send_telegram_message(text), loop)
+            asyncio.run_coroutine_threadsafe(send_telegram_message(text), _telegram_loop)
         except Exception:
             pass
+
+
+async def _on_post_init(app):
+    """Capture Telegram event loop for cross-thread sends."""
+    global _telegram_loop
+    _telegram_loop = asyncio.get_running_loop()
 
 
 # =========================
@@ -228,13 +234,18 @@ PnL: {trade.get('pnl', 'N/A')}
 # =========================
 
 def run_bot():
-    global app_instance
+    global app_instance, _telegram_loop
 
     if not BOT_TOKEN:
         print("⚠️ TELEGRAM_TOKEN not set — Telegram bot disabled")
         return
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(_on_post_init)
+        .build()
+    )
     app_instance = app
 
     app.add_handler(CommandHandler("start", start))
@@ -247,4 +258,5 @@ def run_bot():
     app.add_handler(CommandHandler("help", help_cmd))
 
     print("Telegram bot is running...")
-    app.run_polling()
+    # stop_signals=None avoids signal handling issues when run outside main thread.
+    app.run_polling(stop_signals=None, drop_pending_updates=True)
