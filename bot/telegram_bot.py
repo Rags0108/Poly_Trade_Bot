@@ -32,6 +32,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🌤️ Weather Trading Bot\n\n"
         "Commands:\n"
         "/status — Bot & balance status\n"
+        "/markets — Scanner/market diagnostics\n"
         "/weather <city> — Current weather\n"
         "/positions — Open positions\n"
         "/pnl — P&L summary\n"
@@ -79,6 +80,33 @@ async def weather_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = f"❌ No data for {city_key}"
     except Exception as e:
         msg = f"⚠️ Error: {e}"
+    await update.message.reply_text(msg)
+
+
+async def markets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show market scanner and no-trade diagnostics."""
+    if not _weather_engine:
+        await update.message.reply_text("⚠️ Engine not running")
+        return
+
+    s = _weather_engine.get_full_status()
+    eng = s.get("engine", {})
+    reasons = eng.get("last_no_trade_reasons", {}) or {}
+
+    if reasons:
+        reasons_txt = "\n".join(f"• {k}: {v}" for k, v in list(reasons.items())[:5])
+    else:
+        reasons_txt = "• none"
+
+    msg = (
+        "🧭 Market Diagnostics\n\n"
+        f"Total scanned: {eng.get('last_scan_total_markets', 0)}\n"
+        f"Weather markets: {eng.get('last_scan_weather_markets', 0)}\n"
+        f"Min edge: {eng.get('min_edge_pct', 2.0)}%\n"
+        f"Min confidence: {eng.get('min_confidence', 'mode_default')}\n\n"
+        "No-trade reasons (last scan):\n"
+        f"{reasons_txt}"
+    )
     await update.message.reply_text(msg)
 
 
@@ -250,6 +278,7 @@ def run_bot():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("markets", markets_cmd))
     app.add_handler(CommandHandler("weather", weather_cmd))
     app.add_handler(CommandHandler("positions", positions_cmd))
     app.add_handler(CommandHandler("pnl", pnl_cmd))
