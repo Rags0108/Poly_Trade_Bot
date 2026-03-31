@@ -21,6 +21,7 @@ import json
 import os
 import time
 import threading
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -129,6 +130,14 @@ class WeatherTradingEngine:
         self.scan_interval = scan_interval
         self._running = False
         self._scan_count = 0
+        self._last_scan_total_markets = 0
+        self._last_scan_weather_markets = 0
+        self._last_no_trade_reasons: Dict[str, int] = {}
+
+        # Tunable trading thresholds (can be overridden in Railway env vars).
+        self.min_edge_pct = float(os.getenv("WEATHER_MIN_EDGE", "2.0"))
+        self.min_confidence_override = os.getenv("WEATHER_MIN_CONFIDENCE", "").strip()
+        self.max_scan_markets = int(os.getenv("WEATHER_MAX_SCAN_MARKETS", "200"))
 
         # Core components
         self.weather_client = WeatherAPIClient(
@@ -222,16 +231,29 @@ class WeatherTradingEngine:
                 await self._check_positions()
 
                 # 3. Scan for weather markets
-                markets = self.scanner.scan_markets(limit=200)
+                markets = self.scanner.scan_markets(limit=self.max_scan_markets)
                 weather_markets = [m for m in markets if m.get("price_yes") is not None]
+                self._last_scan_total_markets = len(markets)
+                self._last_scan_weather_markets = len(weather_markets)
+                scan_reason_counter: Counter = Counter()
 
                 if weather_markets:
                     print(f"\n🔍 Scan #{self._scan_count}: Found {len(weather_markets)} weather markets")
 
                     # 4. Run strategies on each market
                     for market_data in weather_markets:
-                        await self._evaluate_market(market_data)
+                        eval_result = await self._evaluate_market(market_data)
+                        for reason in eval_result.get("reasons", []):
+                            scan_reason_counter[reason] += 1
+
+                    self._last_no_trade_reasons = dict(scan_reason_counter)
+                    if scan_reason_counter and self._scan_count % 5 == 0:
+                        top_reasons = ", ".join(
+                            f"{reason}:{count}" for reason, count in scan_reason_counter.most_common(3)
+                        )
+                        print(f"ℹ️ No-trade summary: {top_reasons}")
                 else:
+                    self._last_no_trade_reasons = {"NO_WEATHER_MARKETS": 1}
                     if self._scan_count % 10 == 0:
                         print(f"📭 Scan #{self._scan_count}: No weather markets found")
 
@@ -264,12 +286,19 @@ class WeatherTradingEngine:
         strategy_filter = self.balance_manager.get_strategy_filter()
         disabled = strategy_filter.get("disabled", [])
         min_confidence = strategy_filter.get("min_confidence", 0.5)
+        if self.min_confidence_override:
+            try:
+                min_confidence = float(self.min_confidence_override)
+            except ValueError:
+                pass
 
         signals = []
+        reasons = []
 
         for strategy in self.strategies:
             if strategy.name in disabled:
                 self.strategy_tracker.tick_idle(strategy.name)
+                reasons.append("STRATEGY_DISABLED")
                 continue
 
             try:
@@ -284,23 +313,33 @@ class WeatherTradingEngine:
                     adjusted_confidence = confidence + adj
 
                     # Filter by minimum confidence
-                    if adjusted_confidence >= min_confidence and abs(edge) >= 2:
+                    if adjusted_confidence >= min_confidence and abs(edge) >= self.min_edge_pct:
                         result["adjusted_confidence"] = round(adjusted_confidence, 3)
                         result["tracker_adjustment"] = round(adj, 3)
                         signals.append(result)
+                    else:
+                        if adjusted_confidence < min_confidence:
+                            reasons.append("LOW_CONFIDENCE")
+                        if abs(edge) < self.min_edge_pct:
+                            reasons.append("LOW_EDGE")
                 else:
                     self.strategy_tracker.tick_idle(strategy.name)
+                    reasons.append("NO_DIRECTION")
             except Exception as e:
                 print(f"⚠️ Strategy {strategy.name} error: {e}")
+                reasons.append("STRATEGY_ERROR")
 
         if not signals:
-            return
+            return {"traded": False, "reasons": reasons}
 
         # Pick best signal by effective edge (edge × confidence)
         best = max(signals, key=lambda s: abs(s.get("edge_percent", 0)) * s.get("adjusted_confidence", 0.5))
 
         # Execute trade
-        await self._execute_trade(best, market_data)
+        executed = await self._execute_trade(best, market_data)
+        if not executed:
+            reasons.append("EXECUTION_SKIPPED")
+        return {"traded": bool(executed), "reasons": reasons}
 
     async def _execute_trade(self, signal: dict, market_data: dict):
         """Execute a trade based on the best strategy signal."""
@@ -313,7 +352,7 @@ class WeatherTradingEngine:
         # Check if we can trade
         can_trade, reason = self.balance_manager.can_trade(confidence)
         if not can_trade:
-            return
+            return False
 
         # Get market details
         price_yes = market_data.get("price_yes", 0.5)
@@ -328,7 +367,7 @@ class WeatherTradingEngine:
             token_id = market_data.get("no_token_id", "")
 
         if not token_id or price is None or price <= 0:
-            return
+            return False
 
         # Calculate position size
         size = self.balance_manager.get_position_size(
@@ -339,7 +378,7 @@ class WeatherTradingEngine:
         )
 
         if size <= 0:
-            return
+            return False
 
         # Execute order
         order = self.trader.execute_order(
@@ -351,7 +390,7 @@ class WeatherTradingEngine:
         )
 
         if not order:
-            return
+            return False
 
         # Open position tracking
         shares = order.get("shares", size / price)
@@ -397,6 +436,7 @@ class WeatherTradingEngine:
         print(f"   Edge: {edge_pct:.1f}% | Confidence: {confidence:.1%}")
         print(f"   Kelly: {kelly:.2%} | Balance: ${self.balance_manager.balance:.2f}")
         print(f"{'='*50}\n")
+        return True
 
     async def _check_positions(self):
         """Check all open positions for exit conditions."""
@@ -525,6 +565,11 @@ class WeatherTradingEngine:
                 "running": self._running,
                 "scan_count": self._scan_count,
                 "strategies": len(self.strategies),
+                "last_scan_total_markets": self._last_scan_total_markets,
+                "last_scan_weather_markets": self._last_scan_weather_markets,
+                "last_no_trade_reasons": self._last_no_trade_reasons,
+                "min_edge_pct": self.min_edge_pct,
+                "min_confidence": self.min_confidence_override or "mode_default",
             },
             "balance": self.balance_manager.get_status(),
             "positions": self.position_manager.get_stats(),
